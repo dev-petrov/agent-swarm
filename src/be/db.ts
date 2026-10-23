@@ -222,7 +222,13 @@ import {
   rowToAgentTaskSummary,
 } from "./db/tasks/read";
 import { configureTaskWriteDependencies, failTask } from "./db/tasks/write";
-import { emitChildRunFinished, wakeParentsOfDeletedRuns } from "./db/workflow-runs";
+import {
+  emitChildRunFinished,
+  getRunLineageBlock,
+  getStepExecutionBlock,
+  WorkflowStepNotExecutableError,
+  wakeParentsOfDeletedRuns,
+} from "./db/workflow-runs";
 import { scrubJsonValue } from "./scrub-json";
 import { openSealedJson, sealedJsonForDisplay, sealJson } from "./sealed-json";
 import { configSecretName, registerStoredSecret } from "./secret-registry";
@@ -2855,6 +2861,14 @@ export async function createTaskExtended(
   const claim = await getDbClient().transaction<
     { existing: ExistingTrackerContextWork } | { row: AgentTaskRow }
   >(async () => {
+    // A workflow step's task commits only while the step may still start
+    // work. Checked in the INSERT's transaction: a cascade cancel of the
+    // step's run tree either commits first and is seen here, or sees and
+    // cancels this task.
+    if (options?.workflowRunStepId) {
+      const blocked = await getStepExecutionBlock(options.workflowRunStepId);
+      if (blocked) throw new WorkflowStepNotExecutableError(options.workflowRunStepId, blocked);
+    }
     const existingTrackerWork = options?.bypassTrackerContextDedup
       ? null
       : await findExistingLinearTrackerContextWork(options?.contextKey);
@@ -9812,6 +9826,12 @@ export async function createApprovalRequest(data: {
       } else if (!step || step.runId !== run.id || step.status !== "running") {
         status = "cancelled";
         resolutionReason = `Human-in-the-loop step is ${step?.status ?? "missing"}`;
+      } else {
+        const blocked = await getRunLineageBlock(run.id);
+        if (blocked) {
+          status = "cancelled";
+          resolutionReason = blocked;
+        }
       }
     }
 
